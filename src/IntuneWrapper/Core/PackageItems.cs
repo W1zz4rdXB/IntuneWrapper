@@ -1,0 +1,178 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Runtime.Serialization;
+using System.Text;
+
+namespace IntuneWrapper.Core
+{
+    /// <summary>What happens with an additional file or folder in the package.</summary>
+    public enum PackageItemAction
+    {
+        /// <summary>Only copied into the package (the setup uses it itself).</summary>
+        Include,
+        /// <summary>Driver package(s): installed with pnputil.</summary>
+        InstallInfDrivers,
+        /// <summary>A second installer (.exe/.msi) run silently after the setup.</summary>
+        RunInstaller
+    }
+
+    /// <summary>An additional file or folder packaged with the setup, e.g. a Drivers folder.</summary>
+    [DataContract]
+    public sealed class PackageItem
+    {
+        [DataMember(Name = "sourcePath")] public string SourcePath { get; set; }
+        [DataMember(Name = "action")] public PackageItemAction Action { get; set; }
+
+        /// <summary>For RunInstaller / InstallInfDrivers: the command run by install.cmd (relative to the package root).</summary>
+        [DataMember(Name = "command")] public string Command { get; set; }
+
+        public string Name => Path.GetFileName(SourcePath.TrimEnd('\\'));
+        public bool IsFolder => Directory.Exists(SourcePath);
+
+        public string ActionLabel => Label(Action);
+
+        public static string Label(PackageItemAction action)
+        {
+            switch (action)
+            {
+                case PackageItemAction.InstallInfDrivers: return "Install INF drivers (pnputil)";
+                case PackageItemAction.RunInstaller: return "Run installer (silent)";
+                default: return "Include only";
+            }
+        }
+
+        /// <summary>A new item with a sensible default action and command for what it is.</summary>
+        public static PackageItem Create(string path)
+        {
+            var item = new PackageItem { SourcePath = Path.GetFullPath(path.TrimEnd('\\')) };
+            string ext = Path.GetExtension(item.SourcePath).ToLowerInvariant();
+            if (Directory.Exists(item.SourcePath))
+            {
+                bool hasInf = false;
+                try
+                {
+                    hasInf = Directory.EnumerateFiles(item.SourcePath, "*.inf", SearchOption.AllDirectories).Any();
+                }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+                {
+                    // Treat as plain folder.
+                }
+                item.Action = hasInf ? PackageItemAction.InstallInfDrivers : PackageItemAction.Include;
+            }
+            else if (ext == ".inf")
+            {
+                item.Action = PackageItemAction.InstallInfDrivers;
+            }
+            else if (ext == ".msi" || ext == ".exe")
+            {
+                item.Action = PackageItemAction.RunInstaller;
+            }
+            item.Command = DefaultCommand(item);
+            return item;
+        }
+
+        /// <summary>The default command for the item's action (null for Include).</summary>
+        public static string DefaultCommand(PackageItem item)
+        {
+            switch (item.Action)
+            {
+                case PackageItemAction.InstallInfDrivers:
+                    return item.IsFolder || !File.Exists(item.SourcePath) && !Path.HasExtension(item.SourcePath)
+                        ? "pnputil /add-driver \"" + item.Name + "\\*.inf\" /subdirs /install"
+                        : "pnputil /add-driver \"" + item.Name + "\" /install";
+                case PackageItemAction.RunInstaller:
+                    if (string.Equals(Path.GetExtension(item.Name), ".msi", StringComparison.OrdinalIgnoreCase))
+                        return "msiexec /i \"" + item.Name + "\" /qn /norestart";
+                    try
+                    {
+                        // Same framework detection as the main setup.
+                        InstallerInfo info = InstallerInspector.Inspect(item.SourcePath);
+                        return CommandGenerator.Generate(info, InstallContext.System).Install.Value;
+                    }
+                    catch (Exception)
+                    {
+                        return "\"" + item.Name + "\" /S";
+                    }
+                default:
+                    return null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds install.cmd, which Intune runs when the package contains more than the setup: it runs the setup,
+    /// then each additional installer and driver package, from the package folder. Exit codes follow Intune's
+    /// defaults: 0 success, 3010/1641 success with restart; any other code stops the script and is returned.
+    /// </summary>
+    public static class InstallScript
+    {
+        public const string FileName = "install.cmd";
+        public const string Header = "rem Generated by Intune Wrapper";
+
+        public static bool IsNeeded(IEnumerable<PackageItem> items) =>
+            items != null && items.Any(i => i.Action != PackageItemAction.Include);
+
+        /// <summary>The Intune install command when the script is used.</summary>
+        public const string IntuneCommand = FileName;
+
+        public static string Build(string appName, string setupCommand, IEnumerable<PackageItem> items)
+        {
+            string logName = Summary.SanitizeFileName(appName).Replace(' ', '_') + "-install.log";
+            var sb = new StringBuilder();
+            sb.AppendLine("@echo off");
+            sb.AppendLine(Header + " " + AppInfo.Version + " for " + appName + ". Regenerated on every Convert.");
+            sb.AppendLine("rem Intune install command: " + IntuneCommand);
+            sb.AppendLine("setlocal");
+            sb.AppendLine("cd /d \"%~dp0\"");
+            sb.AppendLine("set \"LOGDIR=%ProgramData%\\IntuneWrapper\\Logs\"");
+            sb.AppendLine("if not exist \"%LOGDIR%\" mkdir \"%LOGDIR%\"");
+            sb.AppendLine("set \"LOG=%LOGDIR%\\" + logName + "\"");
+            sb.AppendLine("set REBOOT=0");
+            sb.AppendLine("rem The Intune agent can run as a 32-bit process: use the 64-bit pnputil when there is one.");
+            sb.AppendLine("set \"PNPUTIL=%SystemRoot%\\System32\\pnputil.exe\"");
+            sb.AppendLine("if exist \"%SystemRoot%\\Sysnative\\pnputil.exe\" set \"PNPUTIL=%SystemRoot%\\Sysnative\\pnputil.exe\"");
+            sb.AppendLine("echo %DATE% %TIME% Start >> \"%LOG%\"");
+
+            int step = 0;
+            AppendStep(sb, ++step, "Setup", setupCommand, false);
+            foreach (PackageItem item in items.Where(i => i.Action != PackageItemAction.Include))
+            {
+                string command = string.IsNullOrWhiteSpace(item.Command) ? PackageItem.DefaultCommand(item) : item.Command.Trim();
+                bool pnp = item.Action == PackageItemAction.InstallInfDrivers;
+                if (pnp && command.StartsWith("pnputil ", StringComparison.OrdinalIgnoreCase))
+                    command = "\"%PNPUTIL%\"" + command.Substring("pnputil".Length);
+                AppendStep(sb, ++step, item.Name, command, pnp);
+            }
+
+            sb.AppendLine("echo %DATE% %TIME% Done (restart needed: %REBOOT%) >> \"%LOG%\"");
+            sb.AppendLine("if \"%REBOOT%\"==\"1\" exit /b 3010");
+            sb.AppendLine("exit /b 0");
+            return sb.ToString();
+        }
+
+        private static void AppendStep(StringBuilder sb, int step, string name, string command, bool pnputil)
+        {
+            sb.AppendLine();
+            sb.AppendLine("rem ---- Step " + step + ": " + name.Replace("%", "%%"));
+            sb.AppendLine("echo %DATE% %TIME% Step " + step + ": " + EscapeEcho(name) + " >> \"%LOG%\"");
+            sb.AppendLine(command + " >> \"%LOG%\" 2>&1");
+            sb.AppendLine("set RC=%ERRORLEVEL%");
+            sb.AppendLine("echo %DATE% %TIME% Step " + step + " exit code %RC% >> \"%LOG%\"");
+            sb.AppendLine("if \"%RC%\"==\"3010\" set REBOOT=1& set RC=0");
+            sb.AppendLine("if \"%RC%\"==\"1641\" set REBOOT=1& set RC=0");
+            if (pnputil)
+            {
+                // 259: driver added to the driver store, but no matching device is present (normal on most PCs).
+                sb.AppendLine("if \"%RC%\"==\"259\" set RC=0");
+            }
+            sb.AppendLine("if not \"%RC%\"==\"0\" exit /b %RC%");
+        }
+
+        private static string EscapeEcho(string text)
+        {
+            return text.Replace("%", "%%").Replace("^", "^^").Replace("&", "^&").Replace("<", "^<").Replace(">", "^>").Replace("|", "^|");
+        }
+    }
+}

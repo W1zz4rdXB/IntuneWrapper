@@ -1,0 +1,15 @@
+﻿<Project>
+  <!-- Single source of truth for the version (SPEC 10.3). -->
+  <PropertyGroup>
+    <Version>1.6.0</Version>
+    <FileVersion>1.6.0.0</FileVersion>
+    <AssemblyVersion>1.6.0.0</AssemblyVersion>
+    <Product>Intune Wrapper</Product>
+    <Company>Intune Wrapper contributors</Company>
+    <Copyright>Copyright (c) 2026 Intune Wrapper contributors. MIT License.</Copyright>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+</Project>
